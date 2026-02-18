@@ -1,4 +1,5 @@
 import { config } from './config.js';
+import { ensureValidToken } from './auth.js';
 import type { AuthOptions, Config } from '../types/config.js';
 import type { ApiError } from '../types/api.js';
 
@@ -11,18 +12,24 @@ export class ApiClient {
     this.authOptions = authOptions;
   }
 
-  private getAuthHeaders(): Record<string, string> {
+  private async getAuthHeaders(): Promise<Record<string, string>> {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
     };
 
-    // Check for token in order of precedence: flag > env > stored
+    // Check for token in order of precedence: flag > env > stored (with refresh)
     let token = this.authOptions.token || process.env.ROWND_API_TOKEN;
     
     if (!token) {
-      const auth = config.getAuth();
-      if (auth?.access_token) {
-        token = auth.access_token;
+      // Try to get a valid token (with automatic refresh if needed)
+      try {
+        token = await ensureValidToken();
+      } catch (error) {
+        // If token refresh fails, fall back to checking stored token without refresh
+        const auth = config.getAuth();
+        if (auth?.access_token) {
+          token = auth.access_token;
+        }
       }
     }
 
@@ -116,7 +123,7 @@ export class ApiClient {
 
     const options: RequestInit = {
       method: 'GET',
-      headers: this.getAuthHeaders(),
+      headers: await this.getAuthHeaders(),
     };
 
     return this.retryRequest<T>(url.toString(), options);
@@ -126,7 +133,7 @@ export class ApiClient {
     const url = new URL(path, this.baseUrl);
     const options: RequestInit = {
       method: 'POST',
-      headers: this.getAuthHeaders(),
+      headers: await this.getAuthHeaders(),
       body: data ? JSON.stringify(data) : undefined,
     };
 
@@ -137,7 +144,7 @@ export class ApiClient {
     const url = new URL(path, this.baseUrl);
     const options: RequestInit = {
       method: 'PUT',
-      headers: this.getAuthHeaders(),
+      headers: await this.getAuthHeaders(),
       body: data ? JSON.stringify(data) : undefined,
     };
 
@@ -148,7 +155,7 @@ export class ApiClient {
     const url = new URL(path, this.baseUrl);
     const options: RequestInit = {
       method: 'PATCH',
-      headers: this.getAuthHeaders(),
+      headers: await this.getAuthHeaders(),
       body: data ? JSON.stringify(data) : undefined,
     };
 
@@ -159,7 +166,7 @@ export class ApiClient {
     const url = new URL(path, this.baseUrl);
     const options: RequestInit = {
       method: 'DELETE',
-      headers: this.getAuthHeaders(),
+      headers: await this.getAuthHeaders(),
     };
 
     return this.retryRequest<T>(url.toString(), options);
