@@ -41,11 +41,10 @@ export async function getOAuthProviders(appKey: string): Promise<OAuthProvider[]
  * Starts the OAuth flow by opening a browser and starting a local server
  * 
  * REQUIREMENTS FOR FULL OAUTH SUPPORT:
- * 1. Rownd API server needs to support localhost redirect URIs (http://localhost:PORT/callback) 
- *    for CLI OAuth applications
+ * 1. Rownd API server needs to support localhost redirect URIs for CLI OAuth applications
  * 2. A Rownd CLI application needs to be created with:
  *    - App key for client identification
- *    - Allowed redirect URIs: http://localhost:*/callback (wildcard port support)
+ *    - Allowed redirect URIs for localhost with wildcard port support
  *    - OIDC/OAuth2 flow enabled
  * 3. The OIDC discovery endpoint may need app-specific configuration
  * 
