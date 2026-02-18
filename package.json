@@ -1,0 +1,42 @@
+{
+  "name": "@rownd/cli",
+  "version": "1.0.0",
+  "description": "Command-line interface for the Rownd authentication platform",
+  "main": "./dist/index.js",
+  "bin": {
+    "rownd": "./dist/index.js"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run clean && npm run build"
+  },
+  "keywords": [
+    "rownd",
+    "authentication",
+    "cli",
+    "auth",
+    "user-management"
+  ],
+  "author": "Rownd, Inc.",
+  "license": "MIT",
+  "dependencies": {
+    "commander": "^12.0.0",
+    "@inquirer/prompts": "^7.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  },
+  "files": [
+    "dist/**/*",
+    "README.md",
+    "LICENSE"
+  ]
+}
