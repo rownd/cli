@@ -1,199 +1,157 @@
-import { createServer, IncomingMessage, ServerResponse } from 'http';
-import { randomBytes } from 'crypto';
+import { createServer, ServerResponse } from 'http';
+import { createHash, randomBytes } from 'crypto';
 import open from 'open';
 import { config } from './config.js';
-import { ROWND_PLATFORM_APP_KEY, ROWND_API_BASE_URL } from './constants.js';
+import {
+  ROWND_OIDC_CLIENT_ID,
+  ROWND_OIDC_ENDPOINTS,
+} from './constants.js';
 
 export interface OAuthTokens {
   access_token: string;
   refresh_token: string;
+  id_token?: string;
   token_type?: string;
   expires_at?: number;
-  user_id?: string;
 }
 
 /**
- * Starts the interactive browser-based auth flow.
+ * Standard OAuth2 Authorization Code + PKCE flow via Rownd's OIDC provider.
  *
- * 1. Spins up a local HTTP server on a random port.
- * 2. Calls /hub/auth/init with a return_url pointing at localhost.
- * 3. Opens the browser so the user can complete sign-in via the Rownd Hub.
- * 4. The Hub redirects back to localhost after auth, or we poll challenge_status.
- * 5. Captures tokens and stores them.
+ * 1. Start local HTTP server on a random port
+ * 2. Open browser to Rownd OIDC authorize endpoint
+ * 3. User signs in via the Rownd Hub
+ * 4. Rownd redirects to localhost with an auth code
+ * 5. CLI exchanges code for tokens via the token endpoint
  */
 export async function startInteractiveLogin(): Promise<OAuthTokens> {
   const port = await getRandomPort();
   const redirectUri = `http://localhost:${port}/callback`;
 
-  // Initiate sign-in via the Rownd Hub
-  const initResp = await fetch(`${ROWND_API_BASE_URL}/hub/auth/init`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-rownd-hub-key': ROWND_PLATFORM_APP_KEY,
-    },
-    body: JSON.stringify({
-      return_url: redirectUri,
-      redirect: true,
-    }),
-  });
+  // PKCE
+  const codeVerifier = base64url(randomBytes(32));
+  const codeChallenge = base64url(createHash('sha256').update(codeVerifier).digest());
+  const state = base64url(randomBytes(16));
 
-  if (!initResp.ok) {
-    const body = await initResp.text();
-    throw new Error(`Auth init failed (${initResp.status}): ${body}`);
-  }
+  // Build authorize URL
+  const authUrl = new URL(ROWND_OIDC_ENDPOINTS.authorization);
+  authUrl.searchParams.set('client_id', ROWND_OIDC_CLIENT_ID);
+  authUrl.searchParams.set('redirect_uri', redirectUri);
+  authUrl.searchParams.set('response_type', 'code');
+  authUrl.searchParams.set('scope', 'openid profile email offline_access');
+  authUrl.searchParams.set('state', state);
+  authUrl.searchParams.set('code_challenge', codeChallenge);
+  authUrl.searchParams.set('code_challenge_method', 'S256');
 
-  const initData = await initResp.json() as Record<string, any>;
-
-  // If tokens came back immediately (e.g. unverified users allowed), done
-  if (initData.auth_tokens?.access_token) {
-    return {
-      access_token: initData.auth_tokens.access_token,
-      refresh_token: initData.auth_tokens.refresh_token,
-      token_type: 'Bearer',
-    };
-  }
-
-  const challengeId: string | undefined = initData.challenge_id;
-
-  // Start local server to catch the redirect callback
-  const tokens = await waitForCallback(port, challengeId);
-  return tokens;
-}
-
-/**
- * Waits for the auth callback on the local server.
- * Also polls challenge_status as a fallback if the redirect doesn't fire.
- */
-function waitForCallback(port: number, challengeId?: string): Promise<OAuthTokens> {
   return new Promise((resolve, reject) => {
-    let resolved = false;
-    const done = (err: Error | null, tokens?: OAuthTokens) => {
-      if (resolved) return;
-      resolved = true;
-      clearInterval(pollTimer);
+    let done = false;
+    const finish = (err: Error | null, tokens?: OAuthTokens) => {
+      if (done) return;
+      done = true;
       server.close();
-      if (err) return reject(err);
-      resolve(tokens!);
+      err ? reject(err) : resolve(tokens!);
     };
 
-    const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
-      if (resolved) { res.end(); return; }
+    const server = createServer(async (req, res) => {
+      if (done) { res.end(); return; }
       const url = new URL(req.url!, `http://localhost:${port}`);
 
-      if (url.pathname === '/callback') {
-        const accessToken = url.searchParams.get('access_token');
-        const refreshToken = url.searchParams.get('refresh_token');
-        const error = url.searchParams.get('error');
+      if (url.pathname !== '/callback') {
+        res.writeHead(404); res.end(); return;
+      }
 
-        if (error) {
-          sendHtml(res, 'Authentication failed. You may close this window.');
-          done(new Error(`Auth error: ${error}`));
-          return;
-        }
+      const error = url.searchParams.get('error');
+      if (error) {
+        sendHtml(res, `❌ ${error}: ${url.searchParams.get('error_description') || ''}`);
+        finish(new Error(`Auth error: ${error}`));
+        return;
+      }
 
-        if (accessToken) {
-          sendHtml(res, '✅ Authentication successful! You may close this window.');
-          done(null, {
-            access_token: accessToken,
-            refresh_token: refreshToken || '',
-            token_type: 'Bearer',
-          });
-          return;
-        }
+      const code = url.searchParams.get('code');
+      const returnedState = url.searchParams.get('state');
 
-        // If no tokens in the URL params, try to get them from challenge status
-        if (challengeId) {
-          try {
-            const tokens = await pollChallengeOnce(challengeId);
-            if (tokens) {
-              sendHtml(res, '✅ Authentication successful! You may close this window.');
-              done(null, tokens);
-              return;
-            }
-          } catch { /* fall through */ }
-        }
+      if (returnedState !== state) {
+        sendHtml(res, '❌ State mismatch — possible CSRF. Try again.');
+        finish(new Error('OAuth state mismatch'));
+        return;
+      }
 
-        sendHtml(res, 'Waiting for authentication to complete...');
-        res.end();
-      } else {
-        res.writeHead(404);
-        res.end();
+      if (!code) {
+        sendHtml(res, '❌ No authorization code received.');
+        finish(new Error('No authorization code'));
+        return;
+      }
+
+      // Exchange code for tokens
+      try {
+        const tokens = await exchangeCode(code, redirectUri, codeVerifier);
+        sendHtml(res, '✅ Authenticated! You can close this window.');
+        finish(null, tokens);
+      } catch (err) {
+        sendHtml(res, '❌ Token exchange failed. Check your terminal.');
+        finish(err instanceof Error ? err : new Error(String(err)));
       }
     });
 
     server.listen(port, 'localhost', () => {
-      console.log(`\n🔐 Opening browser for authentication...`);
-      console.log(`  (If the browser doesn't open, visit: http://localhost:${port}/callback)\n`);
-
-      // The return_url from /hub/auth/init should cause the Hub to redirect here.
-      // We also need the user to actually see the Hub sign-in UI. If Rownd's Hub
-      // serves a sign-in page that then redirects, we open that. For now, we
-      // rely on the redirect flow. In future, this could open hub.rownd.io directly.
-      //
-      // If challenge-based: open a Rownd sign-in page URL.
-      // For now, print instructions since the exact Hub URL depends on the app's subdomain.
-      if (challengeId) {
-        console.log('📧 Check your email or phone for a verification link/code.');
-        console.log('   Waiting for verification...\n');
-      }
+      console.log('\n🔐 Opening browser for Rownd sign-in...');
+      open(authUrl.toString()).catch(() => {
+        console.log(`\nCouldn't open browser automatically. Visit:\n  ${authUrl}\n`);
+      });
     });
 
-    // Poll challenge_status if we have a challenge ID
-    let pollTimer: ReturnType<typeof setInterval>;
-    if (challengeId) {
-      pollTimer = setInterval(async () => {
-        if (resolved) return;
-        try {
-          const tokens = await pollChallengeOnce(challengeId);
-          if (tokens) done(null, tokens);
-        } catch { /* keep polling */ }
-      }, 3000);
-    } else {
-      pollTimer = setInterval(() => {}, 999999); // no-op
-    }
-
-    // Timeout after 5 minutes
-    setTimeout(() => done(new Error('Authentication timed out after 5 minutes.')), 5 * 60 * 1000);
-    server.on('error', (err) => done(err));
+    server.on('error', (err) => finish(err));
+    setTimeout(() => finish(new Error('Authentication timed out (5 min).')), 5 * 60 * 1000);
   });
-}
-
-async function pollChallengeOnce(challengeId: string): Promise<OAuthTokens | null> {
-  const resp = await fetch(`${ROWND_API_BASE_URL}/hub/auth/challenge_status`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-rownd-hub-key': ROWND_PLATFORM_APP_KEY,
-    },
-    body: JSON.stringify({ challenge_id: challengeId }),
-  });
-
-  if (!resp.ok) return null;
-
-  const data = await resp.json() as Record<string, any>;
-  if (data.access_token) {
-    return {
-      access_token: data.access_token,
-      refresh_token: data.refresh_token || '',
-      token_type: 'Bearer',
-      user_id: data.app_user_id,
-    };
-  }
-  return null;
 }
 
 /**
- * Refreshes an access token using a stored refresh token.
+ * Exchange authorization code for tokens at the OIDC token endpoint.
+ */
+async function exchangeCode(
+  code: string,
+  redirectUri: string,
+  codeVerifier: string,
+): Promise<OAuthTokens> {
+  const resp = await fetch(ROWND_OIDC_ENDPOINTS.token, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri: redirectUri,
+      client_id: ROWND_OIDC_CLIENT_ID,
+      code_verifier: codeVerifier,
+    }),
+  });
+
+  if (!resp.ok) {
+    const body = await resp.text();
+    throw new Error(`Token exchange failed (${resp.status}): ${body}`);
+  }
+
+  const data = await resp.json() as Record<string, any>;
+  return {
+    access_token: data.access_token,
+    refresh_token: data.refresh_token,
+    id_token: data.id_token,
+    token_type: data.token_type || 'Bearer',
+    expires_at: data.expires_in ? Date.now() + data.expires_in * 1000 : undefined,
+  };
+}
+
+/**
+ * Refresh an access token using a stored refresh token.
  */
 export async function refreshAccessToken(refreshToken: string): Promise<OAuthTokens> {
-  const resp = await fetch(`${ROWND_API_BASE_URL}/hub/auth/token`, {
+  const resp = await fetch(ROWND_OIDC_ENDPOINTS.token, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-rownd-hub-key': ROWND_PLATFORM_APP_KEY,
-    },
-    body: JSON.stringify({ refresh_token: refreshToken }),
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'refresh_token',
+      refresh_token: refreshToken,
+      client_id: ROWND_OIDC_CLIENT_ID,
+    }),
   });
 
   if (!resp.ok) {
@@ -205,8 +163,9 @@ export async function refreshAccessToken(refreshToken: string): Promise<OAuthTok
   return {
     access_token: data.access_token,
     refresh_token: data.refresh_token || refreshToken,
-    token_type: 'Bearer',
-    user_id: data.user_id,
+    id_token: data.id_token,
+    token_type: data.token_type || 'Bearer',
+    expires_at: data.expires_in ? Date.now() + data.expires_in * 1000 : undefined,
   };
 }
 
@@ -219,7 +178,6 @@ export async function ensureValidToken(): Promise<string> {
     throw new Error('Not authenticated. Run `rownd auth login`.');
   }
 
-  // If no expiry or still valid (with 5 min buffer), use it
   if (!auth.expires_at || auth.expires_at > Date.now() + 5 * 60 * 1000) {
     return auth.access_token;
   }
@@ -234,7 +192,6 @@ export async function ensureValidToken(): Promise<string> {
     refresh_token: tokens.refresh_token,
     token_type: tokens.token_type,
     expires_at: tokens.expires_at,
-    user_id: tokens.user_id || auth.user_id,
   });
   config.save();
   return tokens.access_token;
@@ -244,16 +201,24 @@ export async function ensureValidToken(): Promise<string> {
 
 function getRandomPort(): Promise<number> {
   return new Promise((resolve, reject) => {
-    const srv = createServer();
-    srv.listen(0, () => {
-      const port = (srv.address() as any).port;
-      srv.close(() => resolve(port));
+    const s = createServer();
+    s.listen(0, () => {
+      const port = (s.address() as any).port;
+      s.close(() => resolve(port));
     });
-    srv.on('error', reject);
+    s.on('error', reject);
   });
 }
 
-function sendHtml(res: ServerResponse, message: string) {
+function base64url(buf: Buffer | Uint8Array): string {
+  return Buffer.from(buf)
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=/g, '');
+}
+
+function sendHtml(res: ServerResponse, msg: string) {
   res.writeHead(200, { 'Content-Type': 'text/html' });
-  res.end(`<!DOCTYPE html><html><body style="font-family:system-ui;text-align:center;padding:60px"><h2>${message}</h2><p>Return to your terminal.</p></body></html>`);
+  res.end(`<!DOCTYPE html><html><body style="font-family:system-ui;text-align:center;padding:60px"><h2>${msg}</h2><p>Return to your terminal.</p></body></html>`);
 }

@@ -36,7 +36,7 @@ export function createAuthCommand(): Command {
           access_token: tokens.access_token,
           refresh_token: tokens.refresh_token,
           token_type: 'Bearer',
-          user_id: tokens.user_id,
+          expires_at: tokens.expires_at,
         });
         config.save();
         fmt.success('✅ Successfully signed in to Rownd!');
